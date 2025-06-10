@@ -26,12 +26,12 @@ class HeadControl(Node):
         # Initialize parameters
         self.declare_parameter("image_width", 672.0)
         self.declare_parameter("image_height", 376.0)
-        self.declare_parameter("converge_to_ball_P", [0.1, 0.5])
+        self.declare_parameter("converge_to_ball_P", [1.0, 1.0])
         self.declare_parameter("converge_to_ball_D", [0.0, 0.0])
         self.declare_parameter("max_yaw", 1.5)
         self.declare_parameter("max_pitch", 1.0)
         self.declare_parameter("auto_mode_flag", float('inf'))
-        self.declare_parameter("control_frequency", 10.0)  # Control frequency parameter
+        self.declare_parameter("control_frequency", 20.0)  # Control frequency parameter
         
         # Get parameters and set as class attributes for quick access
         self.image_width = self.get_parameter("image_width").value
@@ -161,7 +161,7 @@ class HeadControl(Node):
         center_y = self.image_height / 2
         error = np.array([
             (curr_coord[0] - center_x) / self.image_width,
-            (curr_coord[1] - center_y) / self.image_height
+            - (curr_coord[1] - center_y) / self.image_height
         ])
         
         # Save current detection information
