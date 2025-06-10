@@ -5,7 +5,6 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import Header
 from try_import import *
 
 class HeadControl(Node):
@@ -41,26 +40,28 @@ class HeadControl(Node):
         # Create subscribers and publishers
         self._vision_sub = self.create_subscription(
             VisionDetections,
-            "THMOS/vision/detections",
+            "vision/detections",
             self._vision_cb,
             1)
         
         self._head_pose_pub = self.create_publisher(
             HeadPose,
-            "THMOS/hardware/set_head_pose",
+            "hardware/set_head_pose",
             1)
             
         self._head_pose_sub = self.create_subscription(
             HeadPose,
-            "THMOS/hardware/get_head_pose",
+            "hardware/get_head_pose",
             self._head_pose_cb,
             1)
             
         self._manual_control_sub = self.create_subscription(
             HeadPose,
-            "THMOS/head_control/manual_command",
+            "head_control/manual_command",
             self._manual_control_cb,
             1)
+
+        self.logger.info("Subscribers and publishers initialized")
 
         # Set initial head pose
         self._set_head_pose(self._manual_target)
