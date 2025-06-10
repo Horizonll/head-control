@@ -32,6 +32,7 @@ class HeadControl(Node):
         self.declare_parameter("max_pitch", 1.0)
         self.declare_parameter("auto_mode_flag", float('inf'))
         self.declare_parameter("control_frequency", 20.0)  # Control frequency parameter
+        self.declare_parameter("enable_plotting", False)
         
         # Get parameters and set as class attributes for quick access
         self.image_width = self.get_parameter("image_width").value
@@ -40,6 +41,7 @@ class HeadControl(Node):
         self.max_pitch = self.get_parameter("max_pitch").value
         self.auto_mode_flag = self.get_parameter("auto_mode_flag").value
         self.control_frequency = self.get_parameter("control_frequency").value
+        self.enable_plotting = self.get_parameter("enable_plotting").value
         
         # Data recording related
         self._data_records = []  # Store control data
@@ -94,8 +96,12 @@ class HeadControl(Node):
         # Create timer for outputting frequency information
         self._freq_timer = self.create_timer(5.0, self._print_frequencies)
         
-        # Create timer for saving data and plotting
-        self._save_timer = self.create_timer(60.0, self._save_data_and_plot)  # Save once per minute
+        # Create timer for saving data and plotting (根据参数决定是否创建)
+        if self.enable_plotting:
+            self._save_timer = self.create_timer(60.0, self._save_data_and_plot)  # Save once per minute
+        else:
+            self._save_timer = None
+            self.logger.info("Plotting function is disabled by default")
         
         self.logger.info("Subscribers and publishers initialized")
         
