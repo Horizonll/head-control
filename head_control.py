@@ -19,10 +19,10 @@ class HeadControl(Node):
         self._detection_timestamps = deque(maxlen=100)  # 存储最近100次检测时间戳
         
         # Initialize parameters
-        self.declare_parameter("image_width", 1280.0)
-        self.declare_parameter("image_height", 720.0)
+        self.declare_parameter("image_width", 672.0)
+        self.declare_parameter("image_height", 376.0)
         self.declare_parameter("converge_to_ball_P", [0.4, 0.4])
-        self.declare_parameter("converge_to_ball_D", [0.2, 0.2])
+        self.declare_parameter("converge_to_ball_D", [0.0, 0.0])
         self.declare_parameter("max_yaw", 1.5)
         self.declare_parameter("max_pitch", 1.0)
         self.declare_parameter("auto_mode_flag", float('inf'))
@@ -81,24 +81,35 @@ class HeadControl(Node):
         # 输出调试信息
         self.logger.debug(f"Vision detection received at: {current_time}")
         self.logger.debug(f"Detection message: xmin={msg.xmin}, ymin={msg.ymin}, xmax={msg.xmax}, ymax={msg.ymax}")
+        self.logger.debug(f"Number of detected objects: {len(msg.detected_objects)}")
         
         # Process vision data only in auto mode
         if self._control_mode != "auto":
             self.logger.debug("Skipping vision processing in non-auto mode")
             return
             
+        # 筛选label为Ball且置信度最高的目标
+        ball_objects = [obj for obj in msg.detected_objects if obj.label == "Ball"]
+        if not ball_objects:
+            self.logger.info("No ball objects detected")
+            return
+            
+        # 找到置信度最高的球
+        best_ball = max(ball_objects, key=lambda obj: obj.confidence)
+        self.logger.info(f"Best ball detected - Confidence: {best_ball.confidence}")
+        
         # Validate message
-        if msg.xmin >= msg.xmax or msg.ymin >= msg.ymax:
-            self.logger.warning("Invalid bounding box received")
+        if best_ball.xmin >= best_ball.xmax or best_ball.ymin >= best_ball.ymax:
+            self.logger.warning("Invalid bounding box received for best ball")
             return
             
         # Calculate target center coordinates
-        curr_coord = (np.array([msg.xmin, msg.ymin]) + 
-                      np.array([msg.xmax, msg.ymax])) * 0.5
+        curr_coord = (np.array([best_ball.xmin, best_ball.ymin]) + 
+                      np.array([best_ball.xmax, best_ball.ymax])) * 0.5
         
         # Calculate normalized error
         center_x = self.image_width / 2
-        center_y = self.image_height / 2
+        center_y = self.image_height / 2 + 100
         error = np.array([
             (curr_coord[0] - center_x) / self.image_width,
             (curr_coord[1] - center_y) / self.image_height
@@ -163,8 +174,11 @@ class HeadControl(Node):
             self.logger.warning("No head pose data available, returning default")
             return np.array([0.0, 0.5])
             
+        # 将ROS时间消息转换为Time对象
+        target_time = Time.from_msg(target_stamp)
+        
         # Remove outdated data points
-        while len(self._head_pose_db) > 1 and self._head_pose_db[1][0] <= target_stamp:
+        while len(self._head_pose_db) > 1 and Time.from_msg(self._head_pose_db[1][0]) <= target_time:
             self.logger.debug(f"Removing outdated head pose data: {self._head_pose_db[0][0]}")
             self._head_pose_db.pop(0)
             
@@ -172,6 +186,10 @@ class HeadControl(Node):
         if len(self._head_pose_db) > 1:
             t1, pose1 = self._head_pose_db[0]
             t2, pose2 = self._head_pose_db[1]
+            
+            # 将时间戳转换为Time对象
+            t1_time = Time.from_msg(t1)
+            t2_time = Time.from_msg(t2)
             
             self.logger.debug(f"Interpolating between: t1={t1}, pose1={pose1}, t2={t2}, pose2={pose2}")
             
