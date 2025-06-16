@@ -24,8 +24,8 @@ class HeadControl(Node):
         self._detection_timestamps = deque(maxlen=100)  # Store last 100 detection timestamps
         
         # Initialize parameters
-        self.declare_parameter("image_width", 672.0)
-        self.declare_parameter("image_height", 376.0)
+        self.declare_parameter("image_width", 1280.0)
+        self.declare_parameter("image_height", 736.0)
         self.declare_parameter("converge_to_ball_P", [1.0, 1.0])
         self.declare_parameter("converge_to_ball_D", [0.0, 0.0])
         self.declare_parameter("max_yaw", 1.5)
@@ -74,18 +74,18 @@ class HeadControl(Node):
             qos)
         
         self._head_pose_pub = self.create_publisher(
-            HeadPose,
+            JointState,
             "hardware/set_head_pose",
             1)
             
         self._head_pose_sub = self.create_subscription(
-            HeadPose,
+            JointState,
             "hardware/get_head_pose",
             self._head_pose_cb,
             qos)
             
         self._manual_control_sub = self.create_subscription(
-            HeadPose,
+            JointState,
             "head_control/manual_command",
             self._manual_control_cb,
             1)
@@ -175,12 +175,15 @@ class HeadControl(Node):
         self._last_error = error
         self._last_stamp = msg.header.stamp
 
-    def _head_pose_cb(self, msg: HeadPose):
+    def _head_pose_cb(self, msg: JointState):
+        yaw = msg.position[0] if len(msg.position) > 0 else 0.0
+        pitch = msg.position[1] if len(msg.position) > 1 else 0.0
+        
         # Output debug information
-        self.logger.debug(f"Head pose received: yaw={msg.yaw}, pitch={msg.pitch}")
+        self.logger.debug(f"Head pose received: yaw={yaw}, pitch={pitch}")
         
         # Store head pose and timestamp (use deque to manage length automatically)
-        self._head_pose_db.append([msg.header.stamp, np.array([msg.yaw, msg.pitch])])
+        self._head_pose_db.append([msg.header.stamp, np.array([yaw, pitch])])
         
         # Output debug information
         self.logger.debug(f"Head pose database updated, size: {len(self._head_pose_db)}")
@@ -303,33 +306,38 @@ class HeadControl(Node):
     def _set_head_pose(self, target):
         """Publish head pose control command"""
         try:
-            msg = HeadPose()
+            msg = JointState()
             msg.header.frame_id = "head_control"
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.yaw = float(target[0])
-            msg.pitch = float(target[1])
+            msg.name = ["head_yaw_joint", "head_pitch_joint"]
+            msg.position = [0.0, 0.0]  # Initialize with zeros
+            msg.position[0] = float(target[0])  # Set yaw
+            msg.position[1] = float(target[1])
             self._head_pose_pub.publish(msg)
             
             # Output debug information
-            self.logger.debug(f"Publishing head pose: yaw={msg.yaw}, pitch={msg.pitch}")
+            self.logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
         except Exception as e:
             self.logger.error(f"Error publishing head pose command: {str(e)}")
 
-    def _manual_control_cb(self, msg: HeadPose):
+    def _manual_control_cb(self, msg: JointState):
         """Handle manual control commands using HeadPose messages"""
         try:
+            yaw = msg.position[0] if len(msg.position) > 0 else 0.0
+            pitch = msg.position[1] if len(msg.position) > 1 else 0.0
+
             # Output debug information
-            self.logger.debug(f"Manual control command received: yaw={msg.yaw}, pitch={msg.pitch}")
+            self.logger.debug(f"Manual control command received: yaw={yaw}, pitch={pitch}")
             
             # Check for auto mode command: yaw=+inf, pitch=any value
-            if msg.yaw == self.auto_mode_flag:
+            if yaw == self.auto_mode_flag:
                 self._control_mode = "auto"
                 self.logger.info("Switched to AUTO control mode")
                 return
                 
             # Any valid yaw and pitch values (excluding auto mode flag) switch to manual mode
-            yaw = np.clip(msg.yaw, -self.max_yaw, self.max_yaw)
-            pitch = np.clip(msg.pitch, -self.max_pitch, self.max_pitch)
+            yaw = np.clip(yaw, -self.max_yaw, self.max_yaw)
+            pitch = np.clip(pitch, -self.max_pitch, self.max_pitch)
             
             self._manual_target = np.array([yaw, pitch])
             self._control_mode = "manual"

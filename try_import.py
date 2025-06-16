@@ -6,7 +6,7 @@ try:
     from rclpy.node import Node
     from std_msgs.msg import Header, Float32
     from geometry_msgs.msg import Pose, Vector3
-    from sensor_msgs.msg import CameraInfo
+    from sensor_msgs.msg import CameraInfo, JointState
     from rclpy.executors import SingleThreadedExecutor
 except Exception as e:
     print("Fatal: Can not import ros2 standard library: " )
@@ -16,12 +16,11 @@ except Exception as e:
 
 
 try:
-    from thmos_msg.msg import HeadPose, ImuData
-    from thmos_msg.msg import Velocity
-    from thmos_msg.msg import VisionObj, VisionDetections
+    from thmos_msgs.msg import Velocity
+    from thmos_msgs.msg import VisionObj, VisionDetections
 except Exception as e:
     print("Fatal: Can not import thmos messages: " )
     print(e)
-    print("Have you source the thmos_msg packages ?")
+    print("Have you source the thmos_msgs packages ?")
     exit(-1)
 
