@@ -25,8 +25,10 @@ class HeadControl(Node):
                         "frequence": 1, \
                         "max_yaw": 1, \
                         "max_pitch": 0.785, \
-                        "converge_to_ball_P": [0.2, 0.2], \
-                        "converge_to_ball_D": [0.01, 0.01]}
+                        "coord_anti_jitter_factor": 0.3, \
+                        "control_anti_jitter_factor": 0.3, \
+                        "converge_to_ball_P": [0.0, 0.0], \
+                        "converge_to_ball_D": [0.05, 0.05]}
         self.ball_target_coord = np.array(self.config.get("image_size")) \
                             * np.array(self.config.get("ball_target_position"))
          
@@ -37,6 +39,10 @@ class HeadControl(Node):
         self._last_error = np.array([0, 0])
         self._prev_error = np.array([0, 0])  # Store previous error
         self._manual_control = np.array([np.nan, np.nan])  
+        
+        # The data received may jit, so we have to smooth it first
+        self._coord_anti_jitter = np.array([0, 0])
+        self._control_anti_jitter = np.array([0, 0])
         
         # Create QoS profile
         qos = QoSProfile(
@@ -68,10 +74,7 @@ class HeadControl(Node):
             "/THMOS/head_control/manual_command",
             self._manual_control_cb,
             1)
- 
-        # Create timer for outputting frequency information
-        self._dbg_timer = self.create_timer(5.0, self._print_debug)
-        
+  
         self.logger.info("Subscribers and publishers initialized")
         self._set_head_pose([0, 0])
         
@@ -92,14 +95,19 @@ class HeadControl(Node):
         # Find the best ball with highest confidence
         best_ball = max(ball_objects, key=lambda obj: obj.confidence)
         # self.logger.info(f"Best ball detected - Confidence: {best_ball.confidence}")
+        
+        # Compute the coordination of the ball in vision
+        self._coord_anti_jitter = self._coord_anti_jitter \
+                * self.config.get("coord_anti_jitter_factor") \
+                + (1.0 - self.config.get("coord_anti_jitter_factor")) \
+                * ( 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
+                    + np.array([best_ball.xmax, best_ball.ymax])) \
+                - self.ball_target_coord )
          
-        # Calculate PID control signal
+        # Calculate normalized error
         time_diff = max(self._get_time_diff(self._last_stamp, \
                         self.get_clock().now().to_msg()), 1e-9)
-        error = ( 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
-                    + np.array([best_ball.xmax, best_ball.ymax])) \
-                    - self.ball_target_coord ) \
-                    / np.array(self.config.get("image_size"))
+        error = self._coord_anti_jitter / np.array(self.config.get("image_size"))
         error *= np.array([1, -1]); # HAVE TO alter the direction
         error_d = (self._last_error - self._prev_error) / time_diff; 
         
@@ -108,16 +116,17 @@ class HeadControl(Node):
         pid_D = self.config.get("converge_to_ball_D")
         control_delta = - (self._last_error * pid_P + error_d * pid_D)
 
-        head_pose = self._get_head_pose(msg.header.stamp)
+        # Add up to the headpose 
+        head_pose = self._get_head_pose(msg.header.stamp) 
+        self._control_anti_jitter = self._control_anti_jitter * \
+                self.config.get("control_anti_jitter_factor") + \
+                (1.0 - self.config.get("control_anti_jitter_factor")) * \
+                (head_pose + control_delta)
+        self._set_head_pose(self._control_anti_jitter)
         
-        control_delta[1] = 0
-        self._set_head_pose(control_delta + head_pose)
-         
-        # Limit output range
-        
-        self.logger.debug(f"Error: {self._last_error}")
-        self.logger.debug(f"Error derivative: {error_d}")
-        self.logger.debug(f"Control delta: {control_delta}")
+        self.logger.info(f"Error: {self._last_error}")
+        self.logger.info(f"Error derivative: {error_d}")
+        self.logger.info(f"Control delta: {control_delta}")
 
         # Save current detection information
         self._prev_stamp, self._last_stamp = self._last_stamp, msg.header.stamp
@@ -145,6 +154,8 @@ class HeadControl(Node):
         if not self._head_pose_db:
             self.logger.warning("No head pose data available, returning default")
             return np.array([0.0, 0.5])
+        
+        return self._head_pose_db[0][1]
 
         # Convert ROS time message to Time object
         target_time = Time.from_msg(target_stamp)
@@ -207,9 +218,9 @@ class HeadControl(Node):
             max_pitch = self.config.get("max_pitch")
             msg.position[0] = float(np.clip(target[0], -max_yaw, max_yaw))
             msg.position[1] = float(np.clip(target[1], -max_pitch, max_pitch))
-            if not self._manual_control[0] == np.nan:
+            if not np.isnan(self._manual_control[0]):
                 msg.position[0] = self._manual_control[0]
-            if not self._manual_control[1] == np.nan:
+            if not np.isnan(self._manual_control[1]):
                 msg.position[1] = self._manual_control[1]
             self._head_pose_pub.publish(msg)
             
@@ -223,45 +234,12 @@ class HeadControl(Node):
         try:
             yaw = msg.position[0] if len(msg.position) > 0 else 0.0
             pitch = msg.position[1] if len(msg.position) > 1 else 0.0
-
-            # Output debug information
-            self.logger.debug(f"Manual control command received: yaw={yaw}, pitch={pitch}")
-             
-            # Any valid yaw and pitch values (excluding auto mode flag) switch to manual mode
-            # yaw = np.clip(yaw, -self.max_yaw, self.max_yaw)
-            # pitch = np.clip(pitch, -self.max_pitch, self.max_pitch)
-            
             self._manual_control = np.array([yaw, pitch])
             self._set_head_pose(self._manual_control)
-            self.logger.info(f"Switched to MANUAL control mode - " +  \
+            self.logger.info(f"Received manual control signal - " +  \
                 "Set head pose: Yaw={yaw}, Pitch={pitch}")
         except Exception as e:
             self.logger.error(f"Error handling manual control command: {str(e)}")
-
-    def _print_debug(self):
-        return
-        """Periodically output control frequency and detection frequency"""
-        current_time = self.get_clock().now()
-        
-        try:
-            # Calculate control frequency
-            if len(self._control_timestamps) >= 2:
-                time_span = (current_time - self._control_timestamps[0]).nanoseconds * 1e-9
-                control_freq = (len(self._control_timestamps) - 1) / max(time_span, 0.001)
-                self.logger.info(f"Control frequency: {control_freq:.2f} Hz (Target: {self.control_frequency} Hz)")
-            else:
-                self.logger.info("Not enough control data to calculate frequency")
-                
-            # Calculate detection frequency
-            if len(self._detection_timestamps) >= 2:
-                time_span = (current_time - self._detection_timestamps[0]).nanoseconds * 1e-9
-                detection_freq = (len(self._detection_timestamps) - 1) / max(time_span, 0.001)
-                self.logger.info(f"Detection frequency: {detection_freq:.2f} Hz")
-            else:
-                self.logger.info("Not enough detection data to calculate frequency")
-        except Exception as e:
-            self.logger.error(f"Error calculating frequencies: {str(e)}")
-
 
     def destroy_node(self):
         super().destroy_node()
