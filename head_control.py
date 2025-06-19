@@ -23,12 +23,11 @@ class HeadControl(Node):
         self.config = {"image_size": [1280, 736], \
                         "ball_target_position": [0.5, 0.5], \
                         "frequence": 1, \
-                        "max_yaw": 1, \
-                        "max_pitch": 0.785, \
-                        "coord_anti_jitter_factor": 0.3, \
-                        "control_anti_jitter_factor": 0.3, \
-                        "converge_to_ball_P": [0.0, 0.0], \
-                        "converge_to_ball_D": [0.05, 0.05]}
+                        "max_yaw": [-1, 1],  # 修改为范围 [min, max]
+                        "max_pitch": [-0.785, 0.785],  # 修改为范围 [min, max]
+                        "converge_to_ball_P": [0.4, 0.4], \
+                        "converge_to_ball_D": [0.0, 0.0],
+                        "input_filter_alpha": 0.5}  # 添加输入滤波参数
         self.ball_target_coord = np.array(self.config.get("image_size")) \
                             * np.array(self.config.get("ball_target_position"))
          
@@ -40,9 +39,8 @@ class HeadControl(Node):
         self._prev_error = np.array([0, 0])  # Store previous error
         self._manual_control = np.array([np.nan, np.nan])  
         
-        # The data received may jit, so we have to smooth it first
-        self._coord_anti_jitter = np.array([0, 0])
-        self._control_anti_jitter = np.array([0, 0])
+        # 初始化输入滤波变量
+        self._filtered_ball_coord = None
         
         # Create QoS profile
         qos = QoSProfile(
@@ -54,7 +52,7 @@ class HeadControl(Node):
         # Create subscribers and publishers
         self._vision_sub = self.create_subscription(
             VisionDetections,
-            "/vision/obj_pos",
+            "/THMOS/vision/obj_pos",
             self._vision_cb,
             qos)
         
@@ -83,6 +81,7 @@ class HeadControl(Node):
         current_time = self.get_clock().now()
         
         # Output debug information
+        print('111111111111')
         self.logger.debug(f"Vision detection received at: {current_time}")
         self.logger.debug(f"Number of detected objects: {len(msg.detected_objects)}")
         
@@ -94,21 +93,31 @@ class HeadControl(Node):
             
         # Find the best ball with highest confidence
         best_ball = max(ball_objects, key=lambda obj: obj.confidence)
-        # self.logger.info(f"Best ball detected - Confidence: {best_ball.confidence}")
+        self.logger.info(f"Best ball detected - {best_ball.xmin} {best_ball.xmax}")
         
         # Compute the coordination of the ball in vision
-        self._coord_anti_jitter = self._coord_anti_jitter \
-                * self.config.get("coord_anti_jitter_factor") \
-                + (1.0 - self.config.get("coord_anti_jitter_factor")) \
-                * ( 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
-                    + np.array([best_ball.xmax, best_ball.ymax])) \
-                - self.ball_target_coord )
-         
-        # Calculate normalized error
-        time_diff = max(self._get_time_diff(self._last_stamp, \
-                        self.get_clock().now().to_msg()), 1e-9)
-        error = self._coord_anti_jitter / np.array(self.config.get("image_size"))
+        ball_coord = 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
+                    + np.array([best_ball.xmax, best_ball.ymax]))
+        
+        # 应用低通滤波器
+        alpha = self.config.get("input_filter_alpha")
+        if self._filtered_ball_coord is None:
+            self._filtered_ball_coord = ball_coord
+        else:
+            self._filtered_ball_coord = alpha * self._filtered_ball_coord + (1 - alpha) * ball_coord
+            
+        self.logger.debug(f"Raw ball coord: {ball_coord}, Filtered: {self._filtered_ball_coord}")
+        
+        # 使用滤波后的坐标计算误差
+        error = (self._filtered_ball_coord - self.ball_target_coord) / np.array(self.config.get("image_size"))
         error *= np.array([1, -1]); # HAVE TO alter the direction
+        
+        # Save current detection information
+        self._prev_stamp, self._last_stamp = self._last_stamp, msg.header.stamp
+        self._prev_error, self._last_error = self._last_error, error
+        
+        # Calculate the derivative of error
+        time_diff = max(self._get_time_diff(self._last_stamp, self._prev_stamp), 1e-9)
         error_d = (self._last_error - self._prev_error) / time_diff; 
         
         # PID output as delta (control, not control change)
@@ -118,19 +127,12 @@ class HeadControl(Node):
 
         # Add up to the headpose 
         head_pose = self._get_head_pose(msg.header.stamp) 
-        self._control_anti_jitter = self._control_anti_jitter * \
-                self.config.get("control_anti_jitter_factor") + \
-                (1.0 - self.config.get("control_anti_jitter_factor")) * \
-                (head_pose + control_delta)
-        self._set_head_pose(self._control_anti_jitter)
+        self._set_head_pose(head_pose + control_delta)
         
         self.logger.info(f"Error: {self._last_error}")
-        self.logger.info(f"Error derivative: {error_d}")
+        self.logger.info(f"Error derivative: {error_d}, dt = {time_diff} last={self._last_error} prev={self._prev_error}")
         self.logger.info(f"Control delta: {control_delta}")
 
-        # Save current detection information
-        self._prev_stamp, self._last_stamp = self._last_stamp, msg.header.stamp
-        self._prev_error, self._last_error = self._last_error, error
 
     def _head_pose_cb(self, msg: JointState):
         yaw = msg.position[0] if len(msg.position) > 0 else 0.0
@@ -145,6 +147,7 @@ class HeadControl(Node):
         # Output debug information
         self.logger.debug(f"Head pose database updated, size: {len(self._head_pose_db)}")
 
+
     def _get_head_pose(self, target_stamp):
         # Output debug information
         self.logger.debug(f"Getting head pose for timestamp: {target_stamp}")
@@ -155,11 +158,8 @@ class HeadControl(Node):
             self.logger.warning("No head pose data available, returning default")
             return np.array([0.0, 0.5])
         
-        return self._head_pose_db[0][1]
-
         # Convert ROS time message to Time object
         target_time = Time.from_msg(target_stamp)
-
              
         # Remove outdated data points (optimize boundary condition check)
         while len(self._head_pose_db) > 1:
@@ -216,8 +216,8 @@ class HeadControl(Node):
             msg.position = [0.0, 0.0]  # Initialize with zeros
             max_yaw = self.config.get("max_yaw")
             max_pitch = self.config.get("max_pitch")
-            msg.position[0] = float(np.clip(target[0], -max_yaw, max_yaw))
-            msg.position[1] = float(np.clip(target[1], -max_pitch, max_pitch))
+            msg.position[0] = float(np.clip(target[0], max_yaw[0], max_yaw[1]))  # 使用范围的最小值和最大值
+            msg.position[1] = float(np.clip(target[1], max_pitch[0], max_pitch[1]))  # 使用范围的最小值和最大值
             if not np.isnan(self._manual_control[0]):
                 msg.position[0] = self._manual_control[0]
             if not np.isnan(self._manual_control[1]):
@@ -250,7 +250,7 @@ if __name__ == '__main__':
     node = HeadControl()
     rclpy.spin(node)
     try:
-        a = 1
+        pass
     except KeyboardInterrupt:
         node.logger.info("Node interrupted by user")
     except Exception as e:
@@ -260,3 +260,4 @@ if __name__ == '__main__':
         if 'node' in locals() and node:
             node.destroy_node()
         rclpy.shutdown()
+    
