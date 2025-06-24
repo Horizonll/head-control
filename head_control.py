@@ -23,11 +23,11 @@ class HeadControl(Node):
         self.config = {"image_size": [1280, 736], \
                         "ball_target_position": [0.5, 0.5], \
                         "frequence": 1, \
-                        "max_yaw": [-1, 1],  # 修改为范围 [min, max]
-                        "max_pitch": [-0.785, 0.785],  # 修改为范围 [min, max]
-                        "converge_to_ball_P": [0.4, 0.4], \
-                        "converge_to_ball_D": [0.0, 0.0],
-                        "input_filter_alpha": 0.5}  # 添加输入滤波参数
+                        "max_yaw": [-1, 1],  # clamp to [min, max]
+                        "max_pitch": [-0.785, 0.785],  # clamp [min, max]
+                        "converge_to_ball_P": [0.6, 0.6], \
+                        "converge_to_ball_D": [0.05, 0.05],
+                        "input_filter_alpha": 0.5}  # exp-filter args, higher is smoother
         self.ball_target_coord = np.array(self.config.get("image_size")) \
                             * np.array(self.config.get("ball_target_position"))
          
@@ -37,9 +37,7 @@ class HeadControl(Node):
         self._prev_stamp = self.get_clock().now().to_msg()
         self._last_error = np.array([0, 0])
         self._prev_error = np.array([0, 0])  # Store previous error
-        self._manual_control = np.array([np.nan, np.nan])  
-        
-        # 初始化输入滤波变量
+        self._manual_control = np.array([np.nan, np.nan])   
         self._filtered_ball_coord = None
         
         # Create QoS profile
@@ -81,43 +79,46 @@ class HeadControl(Node):
         current_time = self.get_clock().now()
         
         # Output debug information
-        print('111111111111')
-        self.logger.debug(f"Vision detection received at: {current_time}")
-        self.logger.debug(f"Number of detected objects: {len(msg.detected_objects)}")
+        # self.logger.debug(f"Vision detection received at: {current_time}")
+        # self.logger.debug(f"Number of detected objects: {len(msg.detected_objects)}")
         
         # Filter objects labeled "Ball" and find the one with highest confidence
         ball_objects = [obj for obj in msg.detected_objects if obj.label == "ball"]
         if not ball_objects:
             self.logger.info("No ball objects detected")
             return
+        
+        # Fetch head pose from database
+        head_pose = self._get_head_pose(msg.header.stamp) 
+        if head_pose is None:
+            self.logger.warn("Outdated head pose!")
+            return  # just do not things before receiving head pose
             
         # Find the best ball with highest confidence
         best_ball = max(ball_objects, key=lambda obj: obj.confidence)
-        self.logger.info(f"Best ball detected - {best_ball.xmin} {best_ball.xmax}")
         
         # Compute the coordination of the ball in vision
         ball_coord = 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
                     + np.array([best_ball.xmax, best_ball.ymax]))
         
-        # 应用低通滤波器
+        # exp-filter
         alpha = self.config.get("input_filter_alpha")
         if self._filtered_ball_coord is None:
             self._filtered_ball_coord = ball_coord
         else:
             self._filtered_ball_coord = alpha * self._filtered_ball_coord + (1 - alpha) * ball_coord
             
-        self.logger.debug(f"Raw ball coord: {ball_coord}, Filtered: {self._filtered_ball_coord}")
+        # self.logger.info(f"Raw ball coord: {ball_coord}, Filtered: {self._filtered_ball_coord}")
         
-        # 使用滤波后的坐标计算误差
+        # compute normalized error
         error = (self._filtered_ball_coord - self.ball_target_coord) / np.array(self.config.get("image_size"))
         error *= np.array([1, -1]); # HAVE TO alter the direction
-        
         # Save current detection information
         self._prev_stamp, self._last_stamp = self._last_stamp, msg.header.stamp
         self._prev_error, self._last_error = self._last_error, error
         
         # Calculate the derivative of error
-        time_diff = max(self._get_time_diff(self._last_stamp, self._prev_stamp), 1e-9)
+        time_diff = max(self._get_time_diff(self._prev_stamp, self._last_stamp), 1e-9)
         error_d = (self._last_error - self._prev_error) / time_diff; 
         
         # PID output as delta (control, not control change)
@@ -126,7 +127,6 @@ class HeadControl(Node):
         control_delta = - (self._last_error * pid_P + error_d * pid_D)
 
         # Add up to the headpose 
-        head_pose = self._get_head_pose(msg.header.stamp) 
         self._set_head_pose(head_pose + control_delta)
         
         self.logger.info(f"Error: {self._last_error}")
@@ -137,26 +137,18 @@ class HeadControl(Node):
     def _head_pose_cb(self, msg: JointState):
         yaw = msg.position[0] if len(msg.position) > 0 else 0.0
         pitch = msg.position[1] if len(msg.position) > 1 else 0.0
-        
-        # Output debug information
-        self.logger.debug(f"Head pose received: yaw={yaw}, pitch={pitch}")
-        
-        # Store head pose and timestamp (use deque to manage length automatically)
         self._head_pose_db.append([msg.header.stamp, np.array([yaw, pitch])])
-        
-        # Output debug information
-        self.logger.debug(f"Head pose database updated, size: {len(self._head_pose_db)}")
 
 
     def _get_head_pose(self, target_stamp):
-        # Output debug information
-        self.logger.debug(f"Getting head pose for timestamp: {target_stamp}")
-        self.logger.debug(f"Head pose database size: {len(self._head_pose_db)}")
-        
-        # Return default pose if no history available
+        # DO NOT RETURN DEFAULT POSITION. WILL CAUSE INCORRECT CONTROL SIGNAL.
+        # Just return None, we'll (and we have to) handle it
         if not self._head_pose_db:
-            self.logger.warning("No head pose data available, returning default")
-            return np.array([0.0, 0.5])
+            return None
+        
+        # TODO: Return real interpolation after the timestamp in vision
+        # represent the time WHEN THE PICTURE WAS TANKEN precisely
+        # return self._head_pose_db[0][1]
         
         # Convert ROS time message to Time object
         target_time = Time.from_msg(target_stamp)
@@ -180,7 +172,7 @@ class HeadControl(Node):
             t1_time = Time.from_msg(t1)
             t2_time = Time.from_msg(t2)
             
-            self.logger.debug(f"Interpolating between: t1={t1}, pose1={pose1}, t2={t2}, pose2={pose2}")
+            # self.logger.debug(f"Interpolating between: t1={t1}, pose1={pose1}, t2={t2}, pose2={pose2}")
             
             time_diff_total = self._get_time_diff(t1, t2)
             time_diff_total = max(time_diff_total, 1e-9)  # Avoid division by zero error
@@ -201,8 +193,7 @@ class HeadControl(Node):
         """Calculate time difference between two timestamps (seconds)"""
         time1 = Time.from_msg(stamp1)
         time2 = Time.from_msg(stamp2)
-        diff = (time2 - time1).nanoseconds * 1e-9
-        self.logger.debug(f"Time difference: {diff} seconds")
+        diff = (time2 - time1).nanoseconds * 1e-9 # + (time2 - time1).seconds
         return diff
 
 
@@ -225,7 +216,7 @@ class HeadControl(Node):
             self._head_pose_pub.publish(msg)
             
             # Output debug information
-            self.logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
+            # self.logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
         except Exception as e:
             self.logger.error(f"Error publishing head pose command: {str(e)}")
 
