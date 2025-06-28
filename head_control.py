@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 
-import sys
+import threading, math, time, sys, os
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from rclpy.time import Time
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from try_import import *
-from collections import deque
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-import os
 from datetime import datetime
+from collections import deque
+
+from try_import import *
 
 class HeadControl(Node):
     def __init__(self):
@@ -20,14 +14,20 @@ class HeadControl(Node):
         self.logger.info("Head control node initialized")
  
         # TODO: upgrade to overridable yaml config 
-        self.config = {"image_size": [1280, 736], \
-                        "ball_target_position": [0.5, 0.5], \
-                        "frequence": 1, \
+        self.config = {"image_size": [1280, 736], 
+                        "ball_target_position": [0.5, 0.5], 
+                        "frequence": 1, 
                         "max_yaw": [-1, 1],  # clamp to [min, max]
                         "max_pitch": [-0.785, 0.785],  # clamp [min, max]
-                        "converge_to_ball_P": [0.6, 0.6], \
-                        "converge_to_ball_D": [0.05, 0.05],
-                        "input_filter_alpha": 0.5}  # exp-filter args, higher is smoother
+                        "converge_to_ball_P": [0.6, 0.6], 
+                        "converge_to_ball_D": [0.05, 0.05], 
+                        "input_filter_alpha": 0.5, # exp-filter args, higher is smoother
+                        "EWMA_ball_confidence_factor": 0.9,
+                        "EWMA_ball_confidence_threshold": 0.5, 
+                        "look_for_ball_point": [[[-0.7, 0.0], 0.5], \
+                                                [[0.7, 0.0], 0.5], \
+                                                [[0.0, 1.0], 0.5]] # pitch, yaw, duration
+                       }  
         self.ball_target_coord = np.array(self.config.get("image_size")) \
                             * np.array(self.config.get("ball_target_position"))
          
@@ -39,20 +39,18 @@ class HeadControl(Node):
         self._prev_error = np.array([0, 0])  # Store previous error
         self._manual_control = np.array([np.nan, np.nan])   
         self._filtered_ball_coord = None
-        
-        # Create QoS profile
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1
-        )
+        self.EWMA_ball_confidence = 0.0
+
+        self._look_for_ball_thread = threading.Thread(target=self._look_for_ball_loop)
+        self._look_for_ball_thread.daemon = True
+        self._look_for_ball_thread.start()
         
         # Create subscribers and publishers
         self._vision_sub = self.create_subscription(
             VisionDetections,
             "/THMOS/vision/obj_pos",
             self._vision_cb,
-            qos)
+            1)
         
         self._head_pose_pub = self.create_publisher(
             JointState,
@@ -63,7 +61,7 @@ class HeadControl(Node):
             JointState,
             "/THMOS/hardware/get_head_pose",
             self._head_pose_cb,
-            qos)
+            1)
             
         self._manual_control_sub = self.create_subscription(
             JointState,
@@ -73,51 +71,35 @@ class HeadControl(Node):
   
         self.logger.info("Subscribers and publishers initialized")
         self._set_head_pose([0, 0])
-        
 
-    def _vision_cb(self, msg: VisionDetections):
-        current_time = self.get_clock().now()
+    
+    def _PID_to_ball(self, best_ball: VisionObj, head_pose, timestamp) -> None:
+        "PID converge to ball"
+        logger = self.logger.get_child("PID_to_ball")
         
-        # Output debug information
-        # self.logger.debug(f"Vision detection received at: {current_time}")
-        # self.logger.debug(f"Number of detected objects: {len(msg.detected_objects)}")
-        
-        # Filter objects labeled "Ball" and find the one with highest confidence
-        ball_objects = [obj for obj in msg.detected_objects if obj.label == "ball"]
-        if not ball_objects:
-            self.logger.info("No ball objects detected")
+        # verify head pose and ball 
+        if head_pose is None or best_ball is None:
             return
-        
-        # Fetch head pose from database
-        head_pose = self._get_head_pose(msg.header.stamp) 
-        if head_pose is None:
-            self.logger.warn("Outdated head pose!")
-            return  # just do not things before receiving head pose
-            
-        # Find the best ball with highest confidence
-        best_ball = max(ball_objects, key=lambda obj: obj.confidence)
-        
+
         # Compute the coordination of the ball in vision
+        # with exponential filter for ball coordinate
+        alpha = self.config.get("input_filter_alpha")
         ball_coord = 0.5 * (np.array([best_ball.xmin, best_ball.ymin]) \
                     + np.array([best_ball.xmax, best_ball.ymax]))
-        
-        # exp-filter
-        alpha = self.config.get("input_filter_alpha")
         if self._filtered_ball_coord is None:
             self._filtered_ball_coord = ball_coord
         else:
             self._filtered_ball_coord = alpha * self._filtered_ball_coord + (1 - alpha) * ball_coord
             
-        # self.logger.info(f"Raw ball coord: {ball_coord}, Filtered: {self._filtered_ball_coord}")
-        
-        # compute normalized error
-        error = (self._filtered_ball_coord - self.ball_target_coord) / np.array(self.config.get("image_size"))
+        # Compute normalized error
+        error = (self._filtered_ball_coord - self.ball_target_coord) \
+                / np.array(self.config.get("image_size"))
         error *= np.array([1, -1]); # HAVE TO alter the direction
+
         # Save current detection information
-        self._prev_stamp, self._last_stamp = self._last_stamp, msg.header.stamp
+        # and calculate the derivative of error
+        self._prev_stamp, self._last_stamp = self._last_stamp, timestamp
         self._prev_error, self._last_error = self._last_error, error
-        
-        # Calculate the derivative of error
         time_diff = max(self._get_time_diff(self._prev_stamp, self._last_stamp), 1e-9)
         error_d = (self._last_error - self._prev_error) / time_diff; 
         
@@ -128,11 +110,54 @@ class HeadControl(Node):
 
         # Add up to the headpose 
         self._set_head_pose(head_pose + control_delta)
-        
-        self.logger.info(f"Error: {self._last_error}")
-        self.logger.info(f"Error derivative: {error_d}, dt = {time_diff} last={self._last_error} prev={self._prev_error}")
-        self.logger.info(f"Control delta: {control_delta}")
 
+
+    def _update_ball_confidence(self, best_ball: VisionObj):
+        "update ball confidence"
+        logger = self.logger.get_child("update_ball_confidence")
+        self.EWMA_ball_confidence *= self.config.get("EWMA_ball_confidence_factor")
+        if best_ball:
+            self.EWMA_ball_confidence += best_ball.confidence
+         
+
+    def _look_for_ball_loop(self):
+        "looking for ball if ball is lost"
+        logger = self.logger.get_child("look_for_ball_loop")
+        point_with_time = self.config.get("look_for_ball_point")
+        n = len(point_with_time)
+        point = np.fromiter((xy for x in point_with_time for xy in x[0]), \
+                dtype=float, count=n*2).reshape(n, 2)
+        gap_time = np.fromiter((x[1] for x in point_with_time), dtype=float, count=n)
+        stime = np.cumsum(gap_time)
+        loop_index = 0
+        while True:
+            if self.EWMA_ball_confidence > \
+                    self.config.get("EWMA_ball_confidence_threshold"):
+                time.sleep(1.0)
+                continue
+            loop_time = math.fmod(time.time_ns() / 1e9, stime[-1])
+            while stime[loop_index] < loop_time:
+                loop_index += 1
+            if stime[loop_index - 1] > loop_time:
+                loop_index = 0
+            target = point[loop_index]
+            self._set_head_pose(target)
+            time.sleep(0.05)
+
+
+    def _vision_cb(self, msg: VisionDetections):
+        "call back function of vision"
+        # Filter objects labeled "Ball" and find the one with highest confidence
+        # and find the best ball with highest confidence
+        ball_objects = [obj for obj in msg.detected_objects if obj.label == "ball"]
+        best_ball = max(ball_objects, key=lambda obj: obj.confidence) \
+                if ball_objects else None
+
+        self._PID_to_ball(  best_ball = best_ball, \
+                            head_pose = self._get_head_pose(msg.header.stamp), \
+                            timestamp = msg.header.stamp )
+        self._update_ball_confidence(best_ball)
+        
 
     def _head_pose_cb(self, msg: JointState):
         yaw = msg.position[0] if len(msg.position) > 0 else 0.0
@@ -143,6 +168,7 @@ class HeadControl(Node):
     def _get_head_pose(self, target_stamp):
         # DO NOT RETURN DEFAULT POSITION. WILL CAUSE INCORRECT CONTROL SIGNAL.
         # Just return None, we'll (and we have to) handle it
+        logger = self.logger.get_child("get_head_pose")
         if not self._head_pose_db:
             return None
         
@@ -158,7 +184,7 @@ class HeadControl(Node):
             next_stamp = self._head_pose_db[1][0]
             next_time = Time.from_msg(next_stamp)
             if next_time <= target_time:
-                self.logger.debug(f"Removing outdated head pose data: {self._head_pose_db[0][0]}")
+                logger.debug(f"Removing outdated head pose data: {self._head_pose_db[0][0]}")
                 self._head_pose_db.popleft()  # Use popleft() for deque to improve efficiency
             else:
                 break
@@ -172,7 +198,7 @@ class HeadControl(Node):
             t1_time = Time.from_msg(t1)
             t2_time = Time.from_msg(t2)
             
-            # self.logger.debug(f"Interpolating between: t1={t1}, pose1={pose1}, t2={t2}, pose2={pose2}")
+            # logger.debug(f"Interpolating between: t1={t1}, pose1={pose1}, t2={t2}, pose2={pose2}")
             
             time_diff_total = self._get_time_diff(t1, t2)
             time_diff_total = max(time_diff_total, 1e-9)  # Avoid division by zero error
@@ -180,12 +206,12 @@ class HeadControl(Node):
             time_diff = self._get_time_diff(t1, target_stamp)
             ratio = min(max(time_diff / time_diff_total, 0.0), 1.0)
             
-            self.logger.debug(f"Interpolation ratio: {ratio}")
+            logger.debug(f"Interpolation ratio: {ratio}")
             
             return pose1 + (pose2 - pose1) * ratio
                 
         # Return latest pose if interpolation not possible
-        self.logger.debug(f"Using latest head pose: {self._head_pose_db[0][1]}")
+        logger.debug(f"Using latest head pose: {self._head_pose_db[0][1]}")
         return self._head_pose_db[0][1]
 
 
@@ -199,6 +225,7 @@ class HeadControl(Node):
 
     def _set_head_pose(self, target):
         """Publish head pose control command"""
+        logger = self.logger.get_child("set_head_pose")
         try:
             msg = JointState()
             msg.header.frame_id = "head_control"
@@ -216,21 +243,23 @@ class HeadControl(Node):
             self._head_pose_pub.publish(msg)
             
             # Output debug information
-            # self.logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
+            logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
         except Exception as e:
-            self.logger.error(f"Error publishing head pose command: {str(e)}")
+            logger.error(f"Error publishing head pose command: {str(e)}")
 
     def _manual_control_cb(self, msg: JointState):
         """Handle manual control commands using HeadPose messages"""
+
+        logger = self.logger.get_child("manual_control_cb")
         try:
             yaw = msg.position[0] if len(msg.position) > 0 else 0.0
             pitch = msg.position[1] if len(msg.position) > 1 else 0.0
             self._manual_control = np.array([yaw, pitch])
             self._set_head_pose(self._manual_control)
-            self.logger.info(f"Received manual control signal - " +  \
+            logger.info(f"Received manual control signal - " +  \
                 "Set head pose: Yaw={yaw}, Pitch={pitch}")
         except Exception as e:
-            self.logger.error(f"Error handling manual control command: {str(e)}")
+            logger.error(f"Error handling manual control command: {str(e)}")
 
     def destroy_node(self):
         super().destroy_node()

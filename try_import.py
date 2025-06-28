@@ -4,6 +4,7 @@
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.time import Time
     from std_msgs.msg import Header, Float32
     from geometry_msgs.msg import Pose, Vector3
     from sensor_msgs.msg import CameraInfo, JointState
