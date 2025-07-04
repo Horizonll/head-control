@@ -37,13 +37,9 @@ class HeadControl(Node):
         self._prev_stamp = self.get_clock().now().to_msg()
         self._last_error = np.array([0, 0])
         self._prev_error = np.array([0, 0])  # Store previous error
-        self._manual_control = np.array([np.nan, np.nan])   
+        self._manual_control = np.array([np.inf, np.inf])   
         self._filtered_ball_coord = None
         self.EWMA_ball_confidence = 0.0
-
-        self._look_for_ball_thread = threading.Thread(target=self._look_for_ball_loop)
-        self._look_for_ball_thread.daemon = True
-        self._look_for_ball_thread.start()
         
         # Create subscribers and publishers
         self._vision_sub = self.create_subscription(
@@ -71,6 +67,11 @@ class HeadControl(Node):
   
         self.logger.info("Subscribers and publishers initialized")
         self._set_head_pose([0, 0])
+
+
+        self._look_for_ball_thread = threading.Thread(target=self._look_for_ball_loop)
+        self._look_for_ball_thread.daemon = True
+        self._look_for_ball_thread.start()
 
     
     def _PID_to_ball(self, best_ball: VisionObj, head_pose, timestamp) -> None:
@@ -236,14 +237,15 @@ class HeadControl(Node):
             max_pitch = self.config.get("max_pitch")
             msg.position[0] = float(np.clip(target[0], max_yaw[0], max_yaw[1]))  # 使用范围的最小值和最大值
             msg.position[1] = float(np.clip(target[1], max_pitch[0], max_pitch[1]))  # 使用范围的最小值和最大值
-            if not np.isnan(self._manual_control[0]):
+            print(self._manual_control[0])
+            if not np.isinf(self._manual_control[0]):
                 msg.position[0] = self._manual_control[0]
-            if not np.isnan(self._manual_control[1]):
+            if not np.isinf(self._manual_control[1]):
                 msg.position[1] = self._manual_control[1]
             self._head_pose_pub.publish(msg)
             
             # Output debug information
-            logger.debug(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
+            logger.info(f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}")
         except Exception as e:
             logger.error(f"Error publishing head pose command: {str(e)}")
 
@@ -255,9 +257,9 @@ class HeadControl(Node):
             yaw = msg.position[0] if len(msg.position) > 0 else 0.0
             pitch = msg.position[1] if len(msg.position) > 1 else 0.0
             self._manual_control = np.array([yaw, pitch])
-            self._set_head_pose(self._manual_control)
+            # self._set_head_pose(self._manual_control)
             logger.info(f"Received manual control signal - " +  \
-                "Set head pose: Yaw={yaw}, Pitch={pitch}")
+                f"Set head pose: Yaw={yaw}, Pitch={pitch}")
         except Exception as e:
             logger.error(f"Error handling manual control command: {str(e)}")
 
