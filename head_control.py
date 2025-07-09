@@ -18,7 +18,7 @@ class HeadControl(Node):
         self.config = {
             "image_size": [1280, 736],
             "ball_target_position": [0.5, 0.5],
-            "frequence": 1,
+            "frequence": 100,
             "max_yaw": [-1, 1],  # clamp to [min, max]
             "max_pitch": [-0.785, 0.785],  # clamp [min, max]
             "converge_to_ball_P": [0.6, 0.6],
@@ -27,12 +27,10 @@ class HeadControl(Node):
             "EWMA_ball_confidence_factor": 0.9,
             "EWMA_ball_confidence_threshold": 0.5,
             "look_for_ball_point": [
-                [[-0.7, 0.0], 0.5],
-                [[0.0, 0.0], 0.5],
-                [[0.7, 0.0], 0.5],
+                [[-0.7, 0.0], 1.5],
+                [[0.7, 0.0], 1.5],
                 [[0.7, 1.0], 0.5],
-                [[0.0, 1.0], 0.5],
-                [[-0.7, 1.0], 0.5],
+                [[-0.7, 1.0], 1.5],
             ],  # pitch, yaw, duration
         }
         self.ball_target_coord = np.array(self.config.get("image_size")) * np.array(
@@ -146,9 +144,15 @@ class HeadControl(Node):
                 loop_index += 1
             if stime[loop_index - 1] > loop_time:
                 loop_index = 0
-            target = point[loop_index]
+            alpha = (loop_time - stime[loop_index - 1])
+            if alpha < 0:
+                alpha += stime[-1]
+            alpha /= gap_time[loop_index]
+            target = point[loop_index] * alpha + \
+                    point[loop_index - 1] * (1.0 - alpha);
+            print(f"looptime: {loop_time} index: {loop_index} alpha: {alpha}")
             self._set_head_pose(target)
-            time.sleep(0.05)
+            time.sleep(1.0 / self.config.get("frequence"))
 
     def _vision_cb(self, msg: VisionDetections):
         "call back function of vision"
