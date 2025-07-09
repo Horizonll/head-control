@@ -6,6 +6,7 @@ from datetime import datetime
 from collections import deque
 
 from try_import import *
+import configuration
 
 
 class HeadControl(Node):
@@ -15,24 +16,7 @@ class HeadControl(Node):
         self.logger.info("Head control node initialized")
 
         # TODO: upgrade to overridable yaml config
-        self.config = {
-            "image_size": [1280, 736],
-            "ball_target_position": [0.5, 0.5],
-            "frequence": 100,
-            "max_yaw": [-1, 1],  # clamp to [min, max]
-            "max_pitch": [-0.785, 0.785],  # clamp [min, max]
-            "converge_to_ball_P": [0.6, 0.6],
-            "converge_to_ball_D": [0.05, 0.05],
-            "input_filter_alpha": 0.5,  # exp-filter args, higher is smoother
-            "EWMA_ball_confidence_factor": 0.9,
-            "EWMA_ball_confidence_threshold": 0.5,
-            "look_for_ball_point": [
-                [[-0.7, 0.0], 1.5],
-                [[0.7, 0.0], 1.5],
-                [[0.7, 1.0], 0.5],
-                [[-0.7, 1.0], 1.5],
-            ],  # pitch, yaw, duration
-        }
+        self.config = configuration.load_config()
         self.ball_target_coord = np.array(self.config.get("image_size")) * np.array(
             self.config.get("ball_target_position")
         )
@@ -144,13 +128,15 @@ class HeadControl(Node):
                 loop_index += 1
             if stime[loop_index - 1] > loop_time:
                 loop_index = 0
-            alpha = (loop_time - stime[loop_index - 1])
-            if alpha < 0:
-                alpha += stime[-1]
-            alpha /= gap_time[loop_index]
-            target = point[loop_index] * alpha + \
-                    point[loop_index - 1] * (1.0 - alpha);
-            print(f"looptime: {loop_time} index: {loop_index} alpha: {alpha}")
+            if self.config["interpolation"]:
+                alpha = (loop_time - stime[loop_index - 1])
+                if alpha < 0:
+                    alpha += stime[-1]
+                alpha /= gap_time[loop_index]
+                target = point[loop_index] * alpha + \
+                        point[loop_index - 1] * (1.0 - alpha);
+            else:
+                target = point[loop_index - 1]
             self._set_head_pose(target)
             time.sleep(1.0 / self.config.get("frequence"))
 
@@ -250,7 +236,6 @@ class HeadControl(Node):
             msg.position[1] = float(
                 np.clip(target[1], max_pitch[0], max_pitch[1])
             )  # 使用范围的最小值和最大值
-            print(self._manual_control[0])
             if not np.isinf(self._manual_control[0]):
                 msg.position[0] = self._manual_control[0]
             if not np.isinf(self._manual_control[1]):
