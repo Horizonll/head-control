@@ -244,7 +244,7 @@ class HeadControl(Node):
 
             # Output debug information
             logger.info(
-                f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}"
+               f"Publishing head pose: yaw={msg.position[0]}, pitch={msg.position[1]}"
             )
         except Exception as e:
             logger.error(f"Error publishing head pose command: {str(e)}")
